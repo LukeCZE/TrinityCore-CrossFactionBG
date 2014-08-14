@@ -1,0 +1,1153 @@
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/Battleground.cpp source/src/server/game/Battlegrounds/Battleground.cpp
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/Battleground.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/Battleground.cpp	2014-08-14 12:44:44.782281786 +0200
+@@ -615,7 +615,7 @@
+     {
+         uint32 team = itr->second.Team;
+         if (!team)
+-            team = player->GetTeam();
++            team = player->GetBGTeam();
+         if (team != teamId)
+             player = NULL;
+     }
+@@ -966,6 +966,7 @@
+ 
+     if (player)
+     {
++        player->FitPlayerInTeam(false);
+         // Do next only if found in battleground
+         player->SetBattlegroundId(0, BATTLEGROUND_TYPE_NONE);  // We're not in BG.
+         // reset destination bg team
+@@ -1105,6 +1106,7 @@
+     // setup BG group membership
+     PlayerAddedToBGCheckIfBGIsRunning(player);
+     AddOrSetPlayerToCorrectBgGroup(player, team);
++    player->FitPlayerInTeam(true);
+ }
+ 
+ // this method adds player to his team's bg group, or sets his correct group if player is already in bg group
+@@ -1756,7 +1758,7 @@
+             if (!creditedPlayer || creditedPlayer == killer)
+                 continue;
+ 
+-            if (creditedPlayer->GetTeam() == killer->GetTeam() && creditedPlayer->IsAtGroupRewardDistance(victim))
++            if (creditedPlayer->GetBGTeam() == killer->GetBGTeam() && creditedPlayer->IsAtGroupRewardDistance(victim))
+                 UpdatePlayerScore(creditedPlayer, SCORE_HONORABLE_KILLS, 1);
+         }
+     }
+@@ -1851,7 +1853,7 @@
+ 
+ WorldSafeLocsEntry const* Battleground::GetClosestGraveYard(Player* player)
+ {
+-    return sObjectMgr->GetClosestGraveYard(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetMapId(), player->GetTeam());
++    return sObjectMgr->GetClosestGraveYard(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(), player->GetMapId(), player->GetBGTeam());
+ }
+ 
+ void Battleground::StartTimedAchievement(AchievementCriteriaTimedTypes type, uint32 entry)
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/BattlegroundQueue.cpp source/src/server/game/Battlegrounds/BattlegroundQueue.cpp
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/BattlegroundQueue.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/BattlegroundQueue.cpp	2014-08-14 17:36:28.268620680 +0200
+@@ -140,7 +140,7 @@
+     ginfo->IsInvitedToBGInstanceGUID = 0;
+     ginfo->JoinTime                  = getMSTime();
+     ginfo->RemoveInviteTime          = 0;
+-    ginfo->Team                      = leader->GetTeam();
++    ginfo->Team                      = leader->GetBGTeam();
+     ginfo->ArenaTeamRating           = ArenaRating;
+     ginfo->ArenaMatchmakerRating     = MatchmakerRating;
+     ginfo->OpponentsTeamRating       = 0;
+@@ -154,6 +154,8 @@
+         index += BG_TEAMS_COUNT;
+     if (ginfo->Team == HORDE)
+         index++;
++    if (sWorld->getBoolConfig(CONFIG_CROSSFACTIONBG) && ArenaType == 0)
++        index = BG_QUEUE_MIXED;                      // BG_QUEUE_*_* -> BG_QUEUE_MIXED
+     TC_LOG_DEBUG("bg.battleground", "Adding Group to BattlegroundQueue bgTypeId : %u, bracket_id : %u, index : %u", BgTypeId, bracketId, index);
+ 
+     uint32 lastOnlineTime = getMSTime();
+@@ -198,30 +200,54 @@
+         {
+             if (Battleground* bg = sBattlegroundMgr->GetBattlegroundTemplate(ginfo->BgTypeId))
+             {
+-                uint32 MinPlayers = bg->GetMinPlayersPerTeam();
+-                uint32 qHorde = 0;
+-                uint32 qAlliance = 0;
+-                uint32 q_min_level = bracketEntry->minLevel;
+-                uint32 q_max_level = bracketEntry->maxLevel;
+-                GroupsQueueType::const_iterator itr;
+-                for (itr = m_QueuedGroups[bracketId][BG_QUEUE_NORMAL_ALLIANCE].begin(); itr != m_QueuedGroups[bracketId][BG_QUEUE_NORMAL_ALLIANCE].end(); ++itr)
+-                    if (!(*itr)->IsInvitedToBGInstanceGUID)
+-                        qAlliance += (*itr)->Players.size();
+-                for (itr = m_QueuedGroups[bracketId][BG_QUEUE_NORMAL_HORDE].begin(); itr != m_QueuedGroups[bracketId][BG_QUEUE_NORMAL_HORDE].end(); ++itr)
+-                    if (!(*itr)->IsInvitedToBGInstanceGUID)
+-                        qHorde += (*itr)->Players.size();
+-
+-                // Show queue status to player only (when joining queue)
+-                if (sWorld->getBoolConfig(CONFIG_BATTLEGROUND_QUEUE_ANNOUNCER_PLAYERONLY))
++                if (sWorld->getBoolConfig(CONFIG_CROSSFACTIONBG))
+                 {
+-                    ChatHandler(leader->GetSession()).PSendSysMessage(LANG_BG_QUEUE_ANNOUNCE_SELF, bg->GetName().c_str(), q_min_level, q_max_level,
+-                        qAlliance, (MinPlayers > qAlliance) ? MinPlayers - qAlliance : (uint32)0, qHorde, (MinPlayers > qHorde) ? MinPlayers - qHorde : (uint32)0);
++                    const char *bgName = bg->GetName().c_str();
++                    uint32 MinPlayers = bg->GetMinPlayersPerTeam()*2;
++                    uint32 qPlayers = 0;
++                    uint32 q_min_level = bracketEntry->minLevel;
++                    uint32 q_max_level = bracketEntry->maxLevel;
++                    for (GroupsQueueType::const_iterator itr = m_QueuedGroups[bracketId][BG_QUEUE_MIXED].begin(); itr != m_QueuedGroups[bracketId][BG_QUEUE_MIXED].end(); ++itr)
++                        if (!(*itr)->IsInvitedToBGInstanceGUID)
++                            qPlayers += (*itr)->Players.size();
++
++                    if (sWorld->getBoolConfig(CONFIG_BATTLEGROUND_QUEUE_ANNOUNCER_PLAYERONLY))
++                    {
++                        ChatHandler(leader->GetSession()).PSendSysMessage("Queue status for %s (Lvl: %u to %u) Queued players: %u (Need at least %u more)", bgName, q_min_level, q_max_level, qPlayers, MinPlayers - qPlayers);
++                    }
++                    else
++                    {
++                        std::ostringstream ss;
++                        ss << "|cffff0000[BG Queue Announcer]:|r " << bgName << " -- [" << q_min_level << "-" << q_max_level << "]" << qPlayers << "/" << MinPlayers;
++                        sWorld->SendGlobalText(ss.str().c_str(), NULL);
++                    }
+                 }
+-                // System message
+                 else
+                 {
+-                    sWorld->SendWorldText(LANG_BG_QUEUE_ANNOUNCE_WORLD, bg->GetName().c_str(), q_min_level, q_max_level,
+-                        qAlliance, (MinPlayers > qAlliance) ? MinPlayers - qAlliance : (uint32)0, qHorde, (MinPlayers > qHorde) ? MinPlayers - qHorde : (uint32)0);
++                    const char *bgName = bg->GetName().c_str();
++                    uint32 MinPlayers = bg->GetMinPlayersPerTeam();
++                    uint32 qHorde = 0;
++                    uint32 qAlliance = 0;
++                    uint32 q_min_level = bracketEntry->minLevel;
++                    uint32 q_max_level = bracketEntry->maxLevel;
++                    GroupsQueueType::const_iterator itr;
++                    for (itr = m_QueuedGroups[bracketId][BG_QUEUE_NORMAL_ALLIANCE].begin(); itr != m_QueuedGroups[bracketId][BG_QUEUE_NORMAL_ALLIANCE].end(); ++itr)
++                        if (!(*itr)->IsInvitedToBGInstanceGUID)
++                            qAlliance += (*itr)->Players.size();
++                    for (itr = m_QueuedGroups[bracketId][BG_QUEUE_NORMAL_HORDE].begin(); itr != m_QueuedGroups[bracketId][BG_QUEUE_NORMAL_HORDE].end(); ++itr)
++                        if (!(*itr)->IsInvitedToBGInstanceGUID)
++                            qHorde += (*itr)->Players.size();
++
++                    // Show queue status to player only (when joining queue)
++                    if (sWorld->getBoolConfig(CONFIG_BATTLEGROUND_QUEUE_ANNOUNCER_PLAYERONLY))
++                    {
++                        ChatHandler(leader->GetSession()).PSendSysMessage(LANG_BG_QUEUE_ANNOUNCE_SELF, bgName, q_min_level, q_max_level, qAlliance, (MinPlayers > qAlliance) ? MinPlayers - qAlliance : (uint32)0, qHorde, (MinPlayers > qHorde) ? MinPlayers - qHorde : (uint32)0);
++                    }
++                    // System message
++                    else
++                    {
++                        sWorld->SendWorldText(LANG_BG_QUEUE_ANNOUNCE_WORLD, bgName, q_min_level, q_max_level, qAlliance, (MinPlayers > qAlliance) ? MinPlayers - qAlliance : (uint32)0, qHorde, (MinPlayers > qHorde) ? MinPlayers - qHorde : (uint32)0);
++                    }             
+                 }
+             }
+         }
+@@ -308,7 +334,7 @@
+     {
+         //we must check premade and normal team's queue - because when players from premade are joining bg,
+         //they leave groupinfo so we can't use its players size to find out index
+-        for (uint32 j = index; j < BG_QUEUE_GROUP_TYPES_COUNT; j += BG_TEAMS_COUNT)
++        for (uint32 j = 0; j < BG_QUEUE_GROUP_TYPES_COUNT; ++j)
+         {
+             GroupsQueueType::iterator k = m_QueuedGroups[bracket_id_tmp][j].begin();
+             for (; k != m_QueuedGroups[bracket_id_tmp][j].end(); ++k)
+@@ -498,6 +524,10 @@
+     int32 hordeFree = bg->GetFreeSlotsForTeam(HORDE);
+     int32 aliFree   = bg->GetFreeSlotsForTeam(ALLIANCE);
+ 
++    if (!bg->isArena())
++    if (FillXPlayersToBG(bracket_id, bg, false))
++        return;
++    
+     //iterator for iterating through bg queue
+     GroupsQueueType::const_iterator Ali_itr = m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_ALLIANCE].begin();
+     //count of groups in queue - used to stop cycles
+@@ -746,7 +776,8 @@
+     if (m_QueuedGroups[bracket_id][BG_QUEUE_PREMADE_ALLIANCE].empty() &&
+         m_QueuedGroups[bracket_id][BG_QUEUE_PREMADE_HORDE].empty() &&
+         m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_ALLIANCE].empty() &&
+-        m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_HORDE].empty())
++        m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_HORDE].empty() &&
++        m_QueuedGroups[bracket_id][BG_QUEUE_MIXED].empty())
+         return;
+ 
+     // battleground with free slot for player should be always in the beggining of the queue
+@@ -837,7 +868,8 @@
+     {
+         // if there are enough players in pools, start new battleground or non rated arena
+         if (CheckNormalMatch(bg_template, bracket_id, MinPlayersPerTeam, MaxPlayersPerTeam)
+-            || (bg_template->isArena() && CheckSkirmishForSameFaction(bracket_id, MinPlayersPerTeam)))
++            || (bg_template->isArena() && CheckSkirmishForSameFaction(bracket_id, MinPlayersPerTeam))
++            || CheckCrossFactionMatch(bracket_id, bg_template))
+         {
+             // we successfully created a pool
+             Battleground* bg2 = sBattlegroundMgr->CreateNewBattleground(bgTypeId, bracketEntry, arenaType, false);
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/BattlegroundQueue.h source/src/server/game/Battlegrounds/BattlegroundQueue.h
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/BattlegroundQueue.h	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/BattlegroundQueue.h	2014-08-14 12:51:10.112165568 +0200
+@@ -60,9 +60,10 @@
+     BG_QUEUE_PREMADE_ALLIANCE   = 0,
+     BG_QUEUE_PREMADE_HORDE      = 1,
+     BG_QUEUE_NORMAL_ALLIANCE    = 2,
+-    BG_QUEUE_NORMAL_HORDE       = 3
++    BG_QUEUE_NORMAL_HORDE       = 3,
++    BG_QUEUE_MIXED              = 4
+ };
+-#define BG_QUEUE_GROUP_TYPES_COUNT 4
++#define BG_QUEUE_GROUP_TYPES_COUNT 5
+ 
+ class Battleground;
+ class BattlegroundQueue
+@@ -74,6 +75,9 @@
+         void BattlegroundQueueUpdate(uint32 diff, BattlegroundTypeId bgTypeId, BattlegroundBracketId bracket_id, uint8 arenaType = 0, bool isRated = false, uint32 minRating = 0);
+         void UpdateEvents(uint32 diff);
+ 
++        bool FillXPlayersToBG(BattlegroundBracketId bracket_id, Battleground* bg, bool start = false);
++        bool CheckCrossFactionMatch(BattlegroundBracketId bracket_id, Battleground* bg);        
++        
+         void FillPlayersToBG(Battleground* bg, BattlegroundBracketId bracket_id);
+         bool CheckPremadeMatch(BattlegroundBracketId bracket_id, uint32 MinPlayersPerTeam, uint32 MaxPlayersPerTeam);
+         bool CheckNormalMatch(Battleground* bg_template, BattlegroundBracketId bracket_id, uint32 minPlayers, uint32 maxPlayers);
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundAB.cpp source/src/server/game/Battlegrounds/Zones/BattlegroundAB.cpp
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundAB.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/Zones/BattlegroundAB.cpp	2014-08-14 12:52:11.100463725 +0200
+@@ -239,13 +239,13 @@
+     switch (trigger)
+     {
+         case 3948:                                          // Arathi Basin Alliance Exit.
+-            if (player->GetTeam() != ALLIANCE)
++            if (player->GetBGTeam() != ALLIANCE)
+                 player->GetSession()->SendAreaTriggerMessage("Only The Alliance can use that portal");
+             else
+                 player->LeaveBattleground();
+             break;
+         case 3949:                                          // Arathi Basin Horde Exit.
+-            if (player->GetTeam() != HORDE)
++            if (player->GetBGTeam() != HORDE)
+                 player->GetSession()->SendAreaTriggerMessage("Only The Horde can use that portal");
+             else
+                 player->LeaveBattleground();
+@@ -442,7 +442,7 @@
+         return;
+     }
+ 
+-    TeamId teamIndex = GetTeamIndexByTeamId(source->GetTeam());
++    TeamId teamIndex = GetTeamIndexByTeamId(source->GetBGTeam());
+ 
+     // Check if player really could use this banner, not cheated
+     if (!(m_Nodes[node] == 0 || teamIndex == m_Nodes[node]%2))
+@@ -655,7 +655,7 @@
+ 
+ WorldSafeLocsEntry const* BattlegroundAB::GetClosestGraveYard(Player* player)
+ {
+-    TeamId teamIndex = GetTeamIndexByTeamId(player->GetTeam());
++    TeamId teamIndex = GetTeamIndexByTeamId(player->GetBGTeam());
+ 
+     // Is there any occupied node for this team?
+     std::vector<uint8> nodes;
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundAV.cpp source/src/server/game/Battlegrounds/Zones/BattlegroundAV.cpp
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundAV.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/Zones/BattlegroundAV.cpp	2014-08-14 13:40:43.126699897 +0200
+@@ -65,7 +65,7 @@
+         return;
+ 
+     Battleground::HandleKillPlayer(player, killer);
+-    UpdateScore(player->GetTeam(), -1);
++    UpdateScore(player->GetBGTeam(), -1);
+ }
+ 
+ void BattlegroundAV::HandleKillUnit(Creature* unit, Player* killer)
+@@ -140,16 +140,16 @@
+         DelCreature(AV_CPLACE_TRIGGER18);
+     }
+     else if (entry == BG_AV_CreatureInfo[AV_NPC_N_MINE_N_4][0] || entry == BG_AV_CreatureInfo[AV_NPC_N_MINE_A_4][0] || entry == BG_AV_CreatureInfo[AV_NPC_N_MINE_H_4][0])
+-        ChangeMineOwner(AV_NORTH_MINE, killer->GetTeam());
++        ChangeMineOwner(AV_NORTH_MINE, killer->GetBGTeam());
+     else if (entry == BG_AV_CreatureInfo[AV_NPC_S_MINE_N_4][0] || entry == BG_AV_CreatureInfo[AV_NPC_S_MINE_A_4][0] || entry == BG_AV_CreatureInfo[AV_NPC_S_MINE_H_4][0])
+-        ChangeMineOwner(AV_SOUTH_MINE, killer->GetTeam());
++        ChangeMineOwner(AV_SOUTH_MINE, killer->GetBGTeam());
+ }
+ 
+ void BattlegroundAV::HandleQuestComplete(uint32 questid, Player* player)
+ {
+     if (GetStatus() != STATUS_IN_PROGRESS)
+         return;//maybe we should log this, cause this must be a cheater or a big bug
+-    uint8 team = GetTeamIndexByTeamId(player->GetTeam());
++    uint8 team = GetTeamIndexByTeamId(player->GetBGTeam());
+     /// @todo add reputation, events (including quest not available anymore, next quest availabe, go/npc de/spawning)and maybe honor
+     TC_LOG_DEBUG("bg.battleground", "BG_AV Quest %i completed", questid);
+     switch (questid)
+@@ -163,7 +163,7 @@
+             {
+                 TC_LOG_DEBUG("bg.battleground", "BG_AV Quest %i completed starting with unit upgrading..", questid);
+                 for (BG_AV_Nodes i = BG_AV_NODES_FIRSTAID_STATION; i <= BG_AV_NODES_FROSTWOLF_HUT; ++i)
+-                    if (m_Nodes[i].Owner == player->GetTeam() && m_Nodes[i].State == POINT_CONTROLED)
++                    if (m_Nodes[i].Owner == player->GetBGTeam() && m_Nodes[i].State == POINT_CONTROLED)
+                     {
+                         DePopulateNode(i);
+                         PopulateNode(i);
+@@ -174,21 +174,21 @@
+         case AV_QUEST_A_COMMANDER1:
+         case AV_QUEST_H_COMMANDER1:
+             m_Team_QuestStatus[team][1]++;
+-            RewardReputationToTeam(team, 1, player->GetTeam());
++            RewardReputationToTeam(team, 1, player->GetBGTeam());
+             if (m_Team_QuestStatus[team][1] == 30)
+                 TC_LOG_DEBUG("bg.battleground", "BG_AV Quest %i completed (need to implement some events here", questid);
+             break;
+         case AV_QUEST_A_COMMANDER2:
+         case AV_QUEST_H_COMMANDER2:
+             m_Team_QuestStatus[team][2]++;
+-            RewardReputationToTeam(team, 1, player->GetTeam());
++            RewardReputationToTeam(team, 1, player->GetBGTeam());
+             if (m_Team_QuestStatus[team][2] == 60)
+                 TC_LOG_DEBUG("bg.battleground", "BG_AV Quest %i completed (need to implement some events here", questid);
+             break;
+         case AV_QUEST_A_COMMANDER3:
+         case AV_QUEST_H_COMMANDER3:
+             m_Team_QuestStatus[team][3]++;
+-            RewardReputationToTeam(team, 1, player->GetTeam());
++            RewardReputationToTeam(team, 1, player->GetBGTeam());
+             if (m_Team_QuestStatus[team][3] == 120)
+                 TC_LOG_DEBUG("bg.battleground", "BG_AV Quest %i completed (need to implement some events here", questid);
+             break;
+@@ -503,13 +503,13 @@
+     {
+         case 95:
+         case 2608:
+-            if (player->GetTeam() != ALLIANCE)
++            if (player->GetBGTeam() != ALLIANCE)
+                 player->GetSession()->SendAreaTriggerMessage("Only The Alliance can use that portal");
+             else
+                 player->LeaveBattleground();
+             break;
+         case 2606:
+-            if (player->GetTeam() != HORDE)
++            if (player->GetBGTeam() != HORDE)
+                 player->GetSession()->SendAreaTriggerMessage("Only The Horde can use that portal");
+             else
+                 player->LeaveBattleground();
+@@ -876,9 +876,9 @@
+     BG_AV_Nodes node = GetNodeThroughObject(object);
+ 
+     uint32 owner = m_Nodes[node].Owner; //maybe should name it prevowner
+-    uint32 team = player->GetTeam();
++    uint32 team = player->GetBGTeam();
+ 
+-    if (owner == player->GetTeam() || m_Nodes[node].State != POINT_ASSAULTED)
++    if (owner == player->GetBGTeam() || m_Nodes[node].State != POINT_ASSAULTED)
+         return;
+     if (m_Nodes[node].TotalOwner == AV_NEUTRAL_TEAM)
+     { //until snowfall doesn't belong to anyone it is better handled in assault-code
+@@ -948,7 +948,7 @@
+ 
+     BG_AV_Nodes node = GetNodeThroughObject(object);
+     uint32 owner = m_Nodes[node].Owner; //maybe name it prevowner
+-    uint32 team  = player->GetTeam();
++    uint32 team  = player->GetBGTeam();
+     TC_LOG_DEBUG("bg.battleground", "bg_av: player assaults point object %i node %i", object, node);
+     if (owner == team || team == m_Nodes[node].TotalOwner)
+         return; //surely a gm used this object
+@@ -1145,11 +1145,11 @@
+ 
+     player->GetPosition(x, y);
+ 
+-    pGraveyard = sWorldSafeLocsStore.LookupEntry(BG_AV_GraveyardIds[GetTeamIndexByTeamId(player->GetTeam())+7]);
++    pGraveyard = sWorldSafeLocsStore.LookupEntry(BG_AV_GraveyardIds[GetTeamIndexByTeamId(player->GetBGTeam())+7]);
+     minDist = (pGraveyard->x - x)*(pGraveyard->x - x)+(pGraveyard->y - y)*(pGraveyard->y - y);
+ 
+     for (uint8 i = BG_AV_NODES_FIRSTAID_STATION; i <= BG_AV_NODES_FROSTWOLF_HUT; ++i)
+-        if (m_Nodes[i].Owner == player->GetTeam() && m_Nodes[i].State == POINT_CONTROLED)
++        if (m_Nodes[i].Owner == player->GetBGTeam() && m_Nodes[i].State == POINT_CONTROLED)
+         {
+             entry = sWorldSafeLocsStore.LookupEntry(BG_AV_GraveyardIds[i]);
+             if (entry)
+@@ -1564,7 +1564,7 @@
+ 
+ bool BattlegroundAV::CheckAchievementCriteriaMeet(uint32 criteriaId, Player const* source, Unit const* target, uint32 miscValue)
+ {
+-    uint32 team = source->GetTeam();
++    uint32 team = source->GetBGTeam();
+     switch (criteriaId)
+     {
+         case BG_CRITERIA_CHECK_EVERYTHING_COUNTS:
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundEY.cpp source/src/server/game/Battlegrounds/Zones/BattlegroundEY.cpp
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundEY.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/Zones/BattlegroundEY.cpp	2014-08-14 13:42:28.355214333 +0200
+@@ -227,7 +227,7 @@
+                 else
+                 {
+                     //player is neat flag, so update count:
+-                    m_CurrentPointPlayersCount[2 * i + GetTeamIndexByTeamId(player->GetTeam())]++;
++                    m_CurrentPointPlayersCount[2 * i + GetTeamIndexByTeamId(player->GetBGTeam())]++;
+                     ++j;
+                 }
+             }
+@@ -270,16 +270,16 @@
+                 if (pointOwnerTeamId != m_PointOwnedByTeam[point])
+                 {
+                     //point was uncontrolled and player is from team which captured point
+-                    if (m_PointState[point] == EY_POINT_STATE_UNCONTROLLED && player->GetTeam() == pointOwnerTeamId)
++                    if (m_PointState[point] == EY_POINT_STATE_UNCONTROLLED && player->GetBGTeam() == pointOwnerTeamId)
+                         this->EventTeamCapturedPoint(player, point);
+ 
+                     //point was under control and player isn't from team which controlled it
+-                    if (m_PointState[point] == EY_POINT_UNDER_CONTROL && player->GetTeam() != m_PointOwnedByTeam[point])
++                    if (m_PointState[point] == EY_POINT_UNDER_CONTROL && player->GetBGTeam() != m_PointOwnedByTeam[point])
+                         this->EventTeamLostPoint(player, point);
+                 }
+ 
+                 /// @workaround The original AreaTrigger is covered by a bigger one and not triggered on client side.
+-                if (point == FEL_REAVER && m_PointOwnedByTeam[point] == player->GetTeam())
++                if (point == FEL_REAVER && m_PointOwnedByTeam[point] == player->GetBGTeam())
+                     if (m_FlagState && GetFlagPickerGUID() == player->GetGUID())
+                         if (player->GetDistance(2044.0f, 1729.729f, 1190.03f) < 3.0f)
+                             EventPlayerCapturedFlag(player, BG_EY_OBJECT_FLAG_FEL_REAVER);
+@@ -403,22 +403,22 @@
+     switch (trigger)
+     {
+         case TR_BLOOD_ELF_POINT:
+-            if (m_PointState[BLOOD_ELF] == EY_POINT_UNDER_CONTROL && m_PointOwnedByTeam[BLOOD_ELF] == player->GetTeam())
++            if (m_PointState[BLOOD_ELF] == EY_POINT_UNDER_CONTROL && m_PointOwnedByTeam[BLOOD_ELF] == player->GetBGTeam())
+                 if (m_FlagState && GetFlagPickerGUID() == player->GetGUID())
+                     EventPlayerCapturedFlag(player, BG_EY_OBJECT_FLAG_BLOOD_ELF);
+             break;
+         case TR_FEL_REAVER_POINT:
+-            if (m_PointState[FEL_REAVER] == EY_POINT_UNDER_CONTROL && m_PointOwnedByTeam[FEL_REAVER] == player->GetTeam())
++            if (m_PointState[FEL_REAVER] == EY_POINT_UNDER_CONTROL && m_PointOwnedByTeam[FEL_REAVER] == player->GetBGTeam())
+                 if (m_FlagState && GetFlagPickerGUID() == player->GetGUID())
+                     EventPlayerCapturedFlag(player, BG_EY_OBJECT_FLAG_FEL_REAVER);
+             break;
+         case TR_MAGE_TOWER_POINT:
+-            if (m_PointState[MAGE_TOWER] == EY_POINT_UNDER_CONTROL && m_PointOwnedByTeam[MAGE_TOWER] == player->GetTeam())
++            if (m_PointState[MAGE_TOWER] == EY_POINT_UNDER_CONTROL && m_PointOwnedByTeam[MAGE_TOWER] == player->GetBGTeam())
+                 if (m_FlagState && GetFlagPickerGUID() == player->GetGUID())
+                     EventPlayerCapturedFlag(player, BG_EY_OBJECT_FLAG_MAGE_TOWER);
+             break;
+         case TR_DRAENEI_RUINS_POINT:
+-            if (m_PointState[DRAENEI_RUINS] == EY_POINT_UNDER_CONTROL && m_PointOwnedByTeam[DRAENEI_RUINS] == player->GetTeam())
++            if (m_PointState[DRAENEI_RUINS] == EY_POINT_UNDER_CONTROL && m_PointOwnedByTeam[DRAENEI_RUINS] == player->GetBGTeam())
+                 if (m_FlagState && GetFlagPickerGUID() == player->GetGUID())
+                     EventPlayerCapturedFlag(player, BG_EY_OBJECT_FLAG_DRAENEI_RUINS);
+             break;
+@@ -637,7 +637,7 @@
+     UpdateWorldState(NETHERSTORM_FLAG_STATE_HORDE, BG_EY_FLAG_STATE_WAIT_RESPAWN);
+     UpdateWorldState(NETHERSTORM_FLAG_STATE_ALLIANCE, BG_EY_FLAG_STATE_WAIT_RESPAWN);
+ 
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+         SendMessageToAll(LANG_BG_EY_DROPPED_FLAG, CHAT_MSG_BG_SYSTEM_ALLIANCE, NULL);
+     else
+         SendMessageToAll(LANG_BG_EY_DROPPED_FLAG, CHAT_MSG_BG_SYSTEM_HORDE, NULL);
+@@ -648,7 +648,7 @@
+     if (GetStatus() != STATUS_IN_PROGRESS || IsFlagPickedup() || !player->IsWithinDistInMap(target_obj, 10))
+         return;
+ 
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+     {
+         UpdateWorldState(NETHERSTORM_FLAG_STATE_ALLIANCE, BG_EY_FLAG_STATE_ON_PLAYER);
+         PlaySoundToAll(BG_EY_SOUND_FLAG_PICKED_UP_ALLIANCE);
+@@ -669,7 +669,7 @@
+     player->CastSpell(player, BG_EY_NETHERSTORM_FLAG_SPELL, true);
+     player->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_ENTER_PVP_COMBAT);
+ 
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+         PSendMessageToAll(LANG_BG_EY_HAS_TAKEN_FLAG, CHAT_MSG_BG_SYSTEM_ALLIANCE, NULL, player->GetName().c_str());
+     else
+         PSendMessageToAll(LANG_BG_EY_HAS_TAKEN_FLAG, CHAT_MSG_BG_SYSTEM_HORDE, NULL, player->GetName().c_str());
+@@ -728,7 +728,7 @@
+     if (GetStatus() != STATUS_IN_PROGRESS)
+         return;
+ 
+-    uint32 Team = player->GetTeam();
++    uint32 Team = player->GetBGTeam();
+ 
+     SpawnBGObject(m_CapturingPointTypes[Point].DespawnNeutralObjectType, RESPAWN_ONE_DAY);
+     SpawnBGObject(m_CapturingPointTypes[Point].DespawnNeutralObjectType + 1, RESPAWN_ONE_DAY);
+@@ -801,7 +801,7 @@
+ 
+     player->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_ENTER_PVP_COMBAT);
+ 
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+         PlaySoundToAll(BG_EY_SOUND_FLAG_CAPTURED_ALLIANCE);
+     else
+         PlaySoundToAll(BG_EY_SOUND_FLAG_CAPTURED_HORDE);
+@@ -812,7 +812,7 @@
+     m_FlagCapturedBgObjectType = BgObjectType;
+ 
+     uint8 team_id = 0;
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+     {
+         team_id = TEAM_ALLIANCE;
+         SendMessageToAll(LANG_BG_EY_CAPTURED_FLAG_A, CHAT_MSG_BG_SYSTEM_ALLIANCE, player);
+@@ -824,7 +824,7 @@
+     }
+ 
+     if (m_TeamPointsCount[team_id] > 0)
+-        AddPoints(player->GetTeam(), BG_EY_FlagPoints[m_TeamPointsCount[team_id] - 1]);
++        AddPoints(player->GetBGTeam(), BG_EY_FlagPoints[m_TeamPointsCount[team_id] - 1]);
+ 
+     UpdatePlayerScore(player, SCORE_FLAG_CAPTURES, 1);
+ }
+@@ -899,7 +899,7 @@
+ {
+     uint32 g_id = 0;
+ 
+-    switch (player->GetTeam())
++    switch (player->GetBGTeam())
+     {
+         case ALLIANCE: g_id = EY_GRAVEYARD_MAIN_ALLIANCE; break;
+         case HORDE:    g_id = EY_GRAVEYARD_MAIN_HORDE;    break;
+@@ -928,7 +928,7 @@
+ 
+     for (uint8 i = 0; i < EY_POINTS_MAX; ++i)
+     {
+-        if (m_PointOwnedByTeam[i] == player->GetTeam() && m_PointState[i] == EY_POINT_UNDER_CONTROL)
++        if (m_PointOwnedByTeam[i] == player->GetBGTeam() && m_PointState[i] == EY_POINT_UNDER_CONTROL)
+         {
+             entry = sWorldSafeLocsStore.LookupEntry(m_CapturingPointTypes[i].GraveYardId);
+             if (!entry)
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundIC.cpp source/src/server/game/Battlegrounds/Zones/BattlegroundIC.cpp
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundIC.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/Zones/BattlegroundIC.cpp	2014-08-14 13:44:50.483909165 +0200
+@@ -427,7 +427,7 @@
+ 
+     // we must end the battleground
+     if (factionReinforcements[player->GetTeamId()] < 1)
+-        EndBattleground(killer->GetTeam());
++        EndBattleground(killer->GetBGTeam());
+ }
+ 
+ void BattlegroundIC::EndBattleground(uint32 winner)
+@@ -807,7 +807,7 @@
+ 
+ WorldSafeLocsEntry const* BattlegroundIC::GetClosestGraveYard(Player* player)
+ {
+-    TeamId teamIndex = GetTeamIndexByTeamId(player->GetTeam());
++    TeamId teamIndex = GetTeamIndexByTeamId(player->GetBGTeam());
+ 
+     // Is there any occupied node for this team?
+     std::vector<uint8> nodes;
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundSA.cpp source/src/server/game/Battlegrounds/Zones/BattlegroundSA.cpp
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundSA.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/Zones/BattlegroundSA.cpp	2014-08-14 13:44:22.495772338 +0200
+@@ -1009,7 +1009,7 @@
+     switch (criteriaId)
+     {
+         case BG_CRITERIA_CHECK_NOT_EVEN_A_SCRATCH:
+-            return _allVehiclesAlive[GetTeamIndexByTeamId(source->GetTeam())];
++            return _allVehiclesAlive[GetTeamIndexByTeamId(source->GetBGTeam())];
+         case BG_CRITERIA_CHECK_DEFENSE_OF_THE_ANCIENTS:
+             return source->GetTeamId() != Attackers && !_gateDestroyed;
+     }
+diff -Naur TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundWS.cpp source/src/server/game/Battlegrounds/Zones/BattlegroundWS.cpp
+--- TrinityCore-4.3.4/src/server/game/Battlegrounds/Zones/BattlegroundWS.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Battlegrounds/Zones/BattlegroundWS.cpp	2014-08-14 13:44:09.723709898 +0200
+@@ -292,7 +292,7 @@
+     uint32 winner = 0;
+ 
+     player->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_ENTER_PVP_COMBAT);
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+     {
+         if (!IsHordeFlagPickedup())
+             return;
+@@ -331,23 +331,23 @@
+         RewardReputationToTeam(889, m_ReputationCapture, HORDE);
+     }
+     //for flag capture is reward 2 honorable kills
+-    RewardHonorToTeam(GetBonusHonorFromKill(2), player->GetTeam());
++    RewardHonorToTeam(GetBonusHonorFromKill(2), player->GetBGTeam());
+ 
+     SpawnBGObject(BG_WS_OBJECT_H_FLAG, BG_WS_FLAG_RESPAWN_TIME);
+     SpawnBGObject(BG_WS_OBJECT_A_FLAG, BG_WS_FLAG_RESPAWN_TIME);
+ 
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+         SendMessageToAll(LANG_BG_WS_CAPTURED_HF, CHAT_MSG_BG_SYSTEM_ALLIANCE, player);
+     else
+         SendMessageToAll(LANG_BG_WS_CAPTURED_AF, CHAT_MSG_BG_SYSTEM_HORDE, player);
+ 
+-    UpdateFlagState(player->GetTeam(), 1);                  // flag state none
++    UpdateFlagState(player->GetBGTeam(), 1);                  // flag state none
+     UpdateTeamScore(player->GetTeamId());
+     // only flag capture should be updated
+     UpdatePlayerScore(player, SCORE_FLAG_CAPTURES, 1);      // +1 flag captures
+ 
+     // update last flag capture to be used if teamscore is equal
+-    SetLastFlagCapture(player->GetTeam());
++    SetLastFlagCapture(player->GetBGTeam());
+ 
+     if (GetTeamScore(TEAM_ALLIANCE) == BG_WS_MAX_TEAM_SCORE)
+         winner = ALLIANCE;
+@@ -368,7 +368,7 @@
+     }
+     else
+     {
+-        _flagsTimer[GetTeamIndexByTeamId(player->GetTeam()) ? 0 : 1] = BG_WS_FLAG_RESPAWN_TIME;
++        _flagsTimer[GetTeamIndexByTeamId(player->GetBGTeam()) ? 0 : 1] = BG_WS_FLAG_RESPAWN_TIME;
+     }
+ }
+ 
+@@ -378,7 +378,7 @@
+     {
+         // if not running, do not cast things at the dropper player (prevent spawning the "dropped" flag), neither send unnecessary messages
+         // just take off the aura
+-        if (player->GetTeam() == ALLIANCE)
++        if (player->GetBGTeam() == ALLIANCE)
+         {
+             if (!IsHordeFlagPickedup())
+                 return;
+@@ -405,7 +405,7 @@
+ 
+     bool set = false;
+ 
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+     {
+         if (!IsHordeFlagPickedup())
+             return;
+@@ -443,9 +443,9 @@
+     if (set)
+     {
+         player->CastSpell(player, SPELL_RECENTLY_DROPPED_FLAG, true);
+-        UpdateFlagState(player->GetTeam(), 1);
++        UpdateFlagState(player->GetBGTeam(), 1);
+ 
+-        if (player->GetTeam() == ALLIANCE)
++        if (player->GetBGTeam() == ALLIANCE)
+         {
+             SendMessageToAll(LANG_BG_WS_DROPPED_HF, CHAT_MSG_BG_SYSTEM_HORDE, player);
+             UpdateWorldState(BG_WS_FLAG_UNK_HORDE, uint32(-1));
+@@ -456,7 +456,7 @@
+             UpdateWorldState(BG_WS_FLAG_UNK_ALLIANCE, uint32(-1));
+         }
+ 
+-        _flagsDropTimer[GetTeamIndexByTeamId(player->GetTeam()) ? 0 : 1] = BG_WS_FLAG_DROP_TIME;
++        _flagsDropTimer[GetTeamIndexByTeamId(player->GetBGTeam()) ? 0 : 1] = BG_WS_FLAG_DROP_TIME;
+     }
+ }
+ 
+@@ -469,7 +469,7 @@
+     ChatMsg type = CHAT_MSG_BG_SYSTEM_NEUTRAL;
+ 
+     //alliance flag picked up from base
+-    if (player->GetTeam() == HORDE && GetFlagState(ALLIANCE) == BG_WS_FLAG_STATE_ON_BASE
++    if (player->GetBGTeam() == HORDE && GetFlagState(ALLIANCE) == BG_WS_FLAG_STATE_ON_BASE
+         && BgObjects[BG_WS_OBJECT_A_FLAG] == target_obj->GetGUID())
+     {
+         message_id = LANG_BG_WS_PICKEDUP_AF;
+@@ -488,7 +488,7 @@
+     }
+ 
+     //horde flag picked up from base
+-    if (player->GetTeam() == ALLIANCE && GetFlagState(HORDE) == BG_WS_FLAG_STATE_ON_BASE
++    if (player->GetBGTeam() == ALLIANCE && GetFlagState(HORDE) == BG_WS_FLAG_STATE_ON_BASE
+         && BgObjects[BG_WS_OBJECT_H_FLAG] == target_obj->GetGUID())
+     {
+         message_id = LANG_BG_WS_PICKEDUP_HF;
+@@ -510,7 +510,7 @@
+     if (GetFlagState(ALLIANCE) == BG_WS_FLAG_STATE_ON_GROUND && player->IsWithinDistInMap(target_obj, 10)
+         && target_obj->GetGOInfo()->entry == BG_OBJECT_A_FLAG_GROUND_WS_ENTRY)
+     {
+-        if (player->GetTeam() == ALLIANCE)
++        if (player->GetBGTeam() == ALLIANCE)
+         {
+             message_id = LANG_BG_WS_RETURNED_AF;
+             type = CHAT_MSG_BG_SYSTEM_ALLIANCE;
+@@ -545,7 +545,7 @@
+     if (GetFlagState(HORDE) == BG_WS_FLAG_STATE_ON_GROUND && player->IsWithinDistInMap(target_obj, 10)
+         && target_obj->GetGOInfo()->entry == BG_OBJECT_H_FLAG_GROUND_WS_ENTRY)
+     {
+-        if (player->GetTeam() == HORDE)
++        if (player->GetBGTeam() == HORDE)
+         {
+             message_id = LANG_BG_WS_RETURNED_HF;
+             type = CHAT_MSG_BG_SYSTEM_HORDE;
+@@ -813,7 +813,7 @@
+     //if a player dies in preparation phase - then the player can't cheat
+     //and teleport to the graveyard outside the flagroom
+     //and start running around, while the doors are still closed
+-    if (player->GetTeam() == ALLIANCE)
++    if (player->GetBGTeam() == ALLIANCE)
+     {
+         if (GetStatus() == STATUS_IN_PROGRESS)
+             return sWorldSafeLocsStore.LookupEntry(WS_GRAVEYARD_MAIN_ALLIANCE);
+@@ -884,7 +884,7 @@
+     switch (criteriaId)
+     {
+         case BG_CRITERIA_CHECK_SAVE_THE_DAY:
+-            return GetFlagState(player->GetTeam()) == BG_WS_FLAG_STATE_ON_BASE;
++            return GetFlagState(player->GetBGTeam()) == BG_WS_FLAG_STATE_ON_BASE;
+     }
+ 
+     return Battleground::CheckAchievementCriteriaMeet(criteriaId, player, target, miscValue);
+diff -Naur TrinityCore-4.3.4/src/server/game/Entities/Player/Player.cpp source/src/server/game/Entities/Player/Player.cpp
+--- TrinityCore-4.3.4/src/server/game/Entities/Player/Player.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Entities/Player/Player.cpp	2014-08-14 16:32:32.193867064 +0200
+@@ -2904,7 +2904,7 @@
+     else
+     {
+         m_ExtraFlags &= ~ PLAYER_EXTRA_GM_ON;
+-        setFactionForRace(getRace());
++        setFactionForRace(GetFakeRaceOrRace());
+         RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_GM);
+         RemoveFlag(UNIT_FIELD_FLAGS_2, UNIT_FLAG2_ALLOW_CHEAT_SPELLS);
+ 
+@@ -7076,7 +7076,7 @@
+ 
+         if (Player* plrVictim = victim->ToPlayer())
+         {
+-            if (GetTeam() == plrVictim->GetTeam() && !sWorld->IsFFAPvPRealm())
++            if (GetBGTeam() == plrVictim->GetBGTeam() && !sWorld->IsFFAPvPRealm())
+                 return false;
+ 
+             uint8 k_level = getLevel();
+@@ -21832,15 +21832,19 @@
+         return;
+     }
+ 
++    bool isMorphed = GetNativeDisplayId() != GetDisplayId();
++    
+     uint8 gender = getGender();
+     switch (gender)
+     {
+         case GENDER_FEMALE:
+-            SetDisplayId(info->displayId_f);
++            if (!isMorphed)
++                SetDisplayId(info->displayId_f);
+             SetNativeDisplayId(info->displayId_f);
+             break;
+         case GENDER_MALE:
+-            SetDisplayId(info->displayId_m);
++            if (!isMorphed)
++                SetDisplayId(info->displayId_m);
+             SetNativeDisplayId(info->displayId_m);
+             break;
+         default:
+@@ -27589,6 +27593,211 @@
+     return pet;
+ }
+ 
++/*####################################################################################
++###############################CROSSFACTION BATTLEGROUNDS#############################
++####################################################################################*/
++
++void Player::FitPlayerInTeam(bool action)
++{
++    ChrRacesEntry const* rEntry = sChrRacesStore.LookupEntry(GetFakeRaceOrRace());
++    if(rEntry && !TeamIsBGTeam() && action)
++        setFaction(rEntry->FactionID);
++    else
++        setFactionForRace(getRace());
++
++    if (action)
++        SetForgetBGPlayers(true);
++    else
++        SetForgetInListPlayers(true);
++
++    MorphFit(action);
++
++    //if (GetBattleground() && action)
++        //ChatHandler(GetSession()).PSendSysMessage("%sYou are playing for the %s%s in this %s", MSG_COLOR_WHITE, GetBGTeam() == ALLIANCE ? MSG_COLOR_DARKBLUE"alliance" : MSG_COLOR_RED"horde", MSG_COLOR_WHITE, GetBattleground()->GetName());
++}
++
++uint8 Player::GetFakeRaceOrRace()
++{
++    if(!TeamIsBGTeam())
++        return GetBGTeam() == ALLIANCE ? RACE_HUMAN : RACE_BLOODELF;
++    else
++        return getRace();
++}
++
++void Player::DoForgetPlayersInList()
++{
++    // m_FakePlayers is filled from a vector within the battleground
++    // they were in previously so all players that have been in that BG will be invalidated.
++    for (FakePlayers::const_iterator itr = m_FakePlayers.begin(); itr != m_FakePlayers.end(); ++itr)
++    {
++        WorldPacket data(SMSG_INVALIDATE_PLAYER, 8);
++        data << *itr;
++        GetSession()->SendPacket(&data);
++        if (Player* pPlayer = ObjectAccessor::FindPlayer(*itr))
++            GetSession()->SendNameQueryOpcode(*itr);
++    }
++    m_FakePlayers.clear();
++}
++
++void Player::DoForgetPlayersInBG(Battleground* pBattleGround)
++{
++    if (!pBattleGround || pBattleGround->isArena())
++        return;
++
++    for (Battleground::BattlegroundPlayerMap::const_iterator itr = pBattleGround->GetPlayers().begin(); itr != pBattleGround->GetPlayers().end(); ++itr)
++    {
++        // Here we invalidate players in the bg to the added player
++        WorldPacket data1(SMSG_INVALIDATE_PLAYER, 8);
++        data1 << itr->first;
++        GetSession()->SendPacket(&data1);
++        GetSession()->SendNameQueryOpcode(itr->first);
++
++        if (Player* pPlayer = ObjectAccessor::FindPlayer(itr->first))
++        {
++            // Here we invalidate the player added to players in the bg
++            WorldPacket data2(SMSG_INVALIDATE_PLAYER, 8);
++            data2 << GetGUID();
++            pPlayer->GetSession()->SendPacket(&data2);
++            pPlayer->GetSession()->SendNameQueryOpcode(GetGUID());
++        }
++    }
++}
++
++bool BattlegroundQueue::CheckCrossFactionMatch(BattlegroundBracketId bracket_id, Battleground* bg)
++{
++    
++    if (!sWorld->getBoolConfig(CONFIG_CROSSFACTIONBG) || bg->isArena())
++        return false; // Only do this if crossbg's are enabled.
++
++    // Here we will add all players to selectionpool, later we check if there are enough and launch a bg.
++    FillXPlayersToBG(bracket_id, bg, true);
++
++    uint8 MPT = bg->GetMinPlayersPerTeam();
++    if (m_SelectionPools[TEAM_ALLIANCE].GetPlayerCount() < MPT || m_SelectionPools[TEAM_HORDE].GetPlayerCount() < MPT)
++    {
++        TC_LOG_DEBUG("entities.player.BattleGroundQueue::CheckCrossFactionMatch", "Not enough players. Has: %u Need: %u", m_SelectionPools[TEAM_ALLIANCE].GetPlayerCount() + m_SelectionPools[TEAM_HORDE].GetPlayerCount(), MPT * 2);
++        return false;
++    }
++    return true;
++}
++
++// This function will invite players in the least populated faction, which makes battleground queues much faster.
++// This function will return true if cross faction battlegrounds are enabled, otherwise return false,
++// which is useful in FillPlayersToBG. Because then we can interrupt the regular invitation if cross faction bg's are enabled.
++bool BattlegroundQueue::FillXPlayersToBG(BattlegroundBracketId bracket_id, Battleground* bg, bool start)
++{
++    if (sWorld->getBoolConfig(CONFIG_CROSSFACTIONBG))
++    {
++        int32 aliFree = start ? bg->GetMinPlayersPerTeam() : bg->GetFreeSlotsForTeam(ALLIANCE);
++        int32 hordeFree = start ? bg->GetMinPlayersPerTeam() : bg->GetFreeSlotsForTeam(HORDE);
++        // Empty selection pools. They will be refilled from queued groups.
++        m_SelectionPools[TEAM_ALLIANCE].Init();
++        m_SelectionPools[TEAM_HORDE].Init();
++        int32 valiFree = aliFree;
++        int32 vhordeFree = hordeFree;
++        int32 diff = 0;
++
++        TC_LOG_DEBUG("entities.player.BattleGroundQueue::FillXPlayersToBG", "valiFree: %u vhordeFree: %u", valiFree, vhordeFree);
++
++        for (GroupsQueueType::iterator itr = m_QueuedGroups[bracket_id][BG_QUEUE_MIXED].begin(); itr != m_QueuedGroups[bracket_id][BG_QUEUE_MIXED].end(); ++itr)
++        {
++            if ((*itr)->IsInvitedToBGInstanceGUID)
++                continue;
++
++            diff = abs(valiFree - vhordeFree);
++            bool moreAli = valiFree < vhordeFree;
++
++            TC_LOG_DEBUG("entities.player.BattleGroundQueue::FillXPlayersToBG", "moreAli: %s", moreAli ? "true" : "false");
++            TC_LOG_DEBUG("entities.player.BattleGroundQueue::FillXPlayersToBG", "diff: %u", diff);
++
++            if (diff > 0)
++                (*itr)->Team = moreAli ? HORDE : ALLIANCE;
++
++            bool alliance = (*itr)->Team == ALLIANCE;
++
++            TC_LOG_DEBUG("entities.player.BattleGroundQueue::FillXPlayersToBG", "Team: %s", alliance ? "ali" : "horde");
++
++            if (m_SelectionPools[alliance ? TEAM_ALLIANCE : TEAM_HORDE].AddGroup((*itr), alliance ? aliFree : hordeFree))
++            {
++                uint8 GSize = (*itr)->Players.size();
++                TC_LOG_DEBUG("entities.player.BattleGroundQueue::FillXPlayersToBG", "Size: %u", GSize);
++                alliance ? valiFree -= GSize : vhordeFree -= GSize;
++            }
++        }
++        return true;
++    }
++    return false;
++}
++
++bool Player::SendBattleGroundChat(uint32 msgtype, std::string message)
++{
++    float distance = msgtype == CHAT_MSG_SAY ? sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_SAY) : sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_YELL);
++
++    if (Battleground* pBattleGround = GetBattleground())
++    {        
++        for (Battleground::BattlegroundPlayerMap::const_iterator itr = pBattleGround->GetPlayers().begin(); itr != pBattleGround->GetPlayers().end(); ++itr)
++        {
++            if (Player* pPlayer = ObjectAccessor::FindPlayer(itr->first))
++            {
++                if (GetDistance2d(pPlayer->GetPositionX(), pPlayer->GetPositionY()) <= distance)
++                {                    
++                    if (GetBGTeam() == pPlayer->GetBGTeam())
++                    {
++                        WorldPacket data(SMSG_MESSAGECHAT, 200);
++                        ChatHandler::BuildChatPacket(data, (ChatMsg)msgtype, Language(LANG_UNIVERSAL), this, this, message);
++                        pPlayer->GetSession()->SendPacket(&data);
++                    }
++                    else if (msgtype != CHAT_MSG_EMOTE)
++                    {
++                        WorldPacket data(SMSG_MESSAGECHAT, 200);
++                        ChatHandler::BuildChatPacket(data, (ChatMsg)msgtype, pPlayer->GetTeam() == ALLIANCE ? LANG_ORCISH : LANG_COMMON, this, this, message);
++                        pPlayer->GetSession()->SendPacket(&data);
++                    }
++                }
++            }
++        }
++        return true;
++    }
++    else
++        return false;
++}
++
++void Player::MorphFit(bool value)
++{
++    if (!TeamIsBGTeam() && value)
++    {
++        if (GetBGTeam() == ALLIANCE)
++        {
++            if (getGender() == GENDER_MALE)
++            {
++                SetDisplayId(19723);
++                SetNativeDisplayId(19723);
++            }
++            else
++            {
++                SetDisplayId(19724);
++                SetNativeDisplayId(19724);
++            }
++        }
++        else
++        {
++            if (getGender() == GENDER_MALE)
++            {
++                SetDisplayId(20578);
++                SetNativeDisplayId(20578);
++            }
++            else
++            {
++                SetDisplayId(20579);
++                SetNativeDisplayId(20579);
++            }
++        }
++    }
++    else
++        InitDisplayIds();
++}
++
++
+ bool Player::IsLoading() const
+ {
+     return GetSession()->PlayerLoading();
+diff -Naur TrinityCore-4.3.4/src/server/game/Entities/Player/Player.h source/src/server/game/Entities/Player/Player.h
+--- TrinityCore-4.3.4/src/server/game/Entities/Player/Player.h	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Entities/Player/Player.h	2014-08-14 13:02:46.819571597 +0200
+@@ -1249,6 +1249,25 @@
+     friend class WorldSession;
+     friend void Item::AddToUpdateQueueOf(Player* player);
+     friend void Item::RemoveFromUpdateQueueOf(Player* player);
++    //CROSSFACION BG START
++private:
++    bool m_ForgetBGPlayers;
++    bool m_ForgetInListPlayers;
++public:
++    typedef std::vector<uint64> FakePlayers;
++    void FitPlayerInTeam(bool action);
++    void DoForgetPlayersInList();
++    void DoForgetPlayersInBG(Battleground* pBattleGround);
++    uint8 GetFakeRaceOrRace();
++    void SetForgetBGPlayers(bool tralse) { m_ForgetBGPlayers = tralse; }
++    bool ShouldForgetBGPlayers() { return m_ForgetBGPlayers; }
++    void SetForgetInListPlayers(bool tralse) { m_ForgetInListPlayers = tralse; }
++    bool ShouldForgetInListPlayers() { return m_ForgetInListPlayers; }
++    bool SendBattleGroundChat(uint32 msgtype, std::string message);
++    void MorphFit(bool value);
++    bool TeamIsBGTeam() { return GetBGTeam() == GetTeam(); }
++    FakePlayers m_FakePlayers;
++    //CROSSFACION BG END
+     public:
+         explicit Player(WorldSession* session);
+         ~Player();
+@@ -2136,6 +2155,7 @@
+         static uint32 TeamForRace(uint8 race);
+         uint32 GetTeam() const { return m_team; }
+         TeamId GetTeamId() const { return m_team == ALLIANCE ? TEAM_ALLIANCE : TEAM_HORDE; }
++        TeamId GetBGTeamId() const { return GetBGTeam() == ALLIANCE ? TEAM_ALLIANCE : TEAM_HORDE; }
+         void setFactionForRace(uint8 race);
+ 
+         void InitDisplayIds();
+diff -Naur TrinityCore-4.3.4/src/server/game/Entities/Unit/Unit.cpp source/src/server/game/Entities/Unit/Unit.cpp
+--- TrinityCore-4.3.4/src/server/game/Entities/Unit/Unit.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Entities/Unit/Unit.cpp	2014-08-14 13:04:08.111969016 +0200
+@@ -14331,7 +14331,7 @@
+ void Unit::RestoreFaction()
+ {
+     if (GetTypeId() == TYPEID_PLAYER)
+-        ToPlayer()->setFactionForRace(getRace());
++        ToPlayer()->setFactionForRace(ToPlayer()->GetFakeRaceOrRace());
+     else
+     {
+         if (HasUnitTypeMask(UNIT_MASK_MINION))
+diff -Naur TrinityCore-4.3.4/src/server/game/Handlers/CharacterHandler.cpp source/src/server/game/Handlers/CharacterHandler.cpp
+--- TrinityCore-4.3.4/src/server/game/Handlers/CharacterHandler.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Handlers/CharacterHandler.cpp	2014-08-14 13:05:25.220345979 +0200
+@@ -1140,6 +1140,24 @@
+     sScriptMgr->OnPlayerLogin(pCurrChar, firstLogin);
+ 
+     delete holder;
++    
++    if (sWorld->getBoolConfig(CONFIG_CROSSFACTIONBG))
++    {
++        float x = pCurrChar->GetPositionX();
++        float y = pCurrChar->GetPositionY();
++        float z = pCurrChar->GetPositionZ();
++        uint32 hm = pCurrChar->m_homebindMapId;
++        float hx = pCurrChar->m_homebindX;
++        float hy = pCurrChar->m_homebindX;
++        float hz = pCurrChar->m_homebindX;
++        if (z+1 < pCurrChar->GetMap()->GetHeight(x, y, MAX_HEIGHT) && pCurrChar->GetMap()->IsOutdoors(x, y, z))
++            pCurrChar->TeleportTo(hm, hx, hy, hz, 0);
++    }
++
++    if (pCurrChar->GetBattleground() && !pCurrChar->GetBattleground()->isArena())
++        pCurrChar->FitPlayerInTeam(true);
++    else
++        pCurrChar->FitPlayerInTeam(false);
+ }
+ 
+ void WorldSession::HandleSetFactionAtWar(WorldPacket& recvData)
+diff -Naur TrinityCore-4.3.4/src/server/game/Handlers/ChatHandler.cpp source/src/server/game/Handlers/ChatHandler.cpp
+--- TrinityCore-4.3.4/src/server/game/Handlers/ChatHandler.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Handlers/ChatHandler.cpp	2014-08-14 13:55:12.374949435 +0200
+@@ -309,7 +309,11 @@
+                 SendNotification(GetTrinityString(LANG_SAY_REQ), sWorld->getIntConfig(CONFIG_CHAT_SAY_LEVEL_REQ));
+                 return;
+             }
+-
++            
++            if (!GetPlayer()->IsGameMaster())
++                if (GetPlayer()->SendBattleGroundChat(type, msg))
++                    return;
++            
+             if (type == CHAT_MSG_SAY)
+                 sender->Say(msg, lang);
+             else if (type == CHAT_MSG_EMOTE)
+diff -Naur TrinityCore-4.3.4/src/server/game/Handlers/MiscHandler.cpp source/src/server/game/Handlers/MiscHandler.cpp
+--- TrinityCore-4.3.4/src/server/game/Handlers/MiscHandler.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Handlers/MiscHandler.cpp	2014-08-14 14:00:09.140400248 +0200
+@@ -1497,6 +1497,21 @@
+ 
+ void WorldSession::HandleTimeSyncResp(WorldPacket& recvData)
+ {
++     Battleground* bg = _player->GetBattleground();
++    if (bg)
++    {
++        if (_player->ShouldForgetBGPlayers())
++        {
++            _player->DoForgetPlayersInBG(bg);
++            _player->SetForgetBGPlayers(false);
++        }
++    }
++    else if (_player->ShouldForgetInListPlayers())
++    {
++        _player->DoForgetPlayersInList();
++        _player->SetForgetInListPlayers(false);
++    }
++    
+     TC_LOG_DEBUG("network", "CMSG_TIME_SYNC_RESP");
+ 
+     uint32 counter, clientTicks;
+diff -Naur TrinityCore-4.3.4/src/server/game/Handlers/QueryHandler.cpp source/src/server/game/Handlers/QueryHandler.cpp
+--- TrinityCore-4.3.4/src/server/game/Handlers/QueryHandler.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Handlers/QueryHandler.cpp	2014-08-14 13:09:59.429686521 +0200
+@@ -48,7 +48,7 @@
+     data << uint8(0);                               // name known
+     data << nameData->m_name;                       // played name
+     data << uint8(0);                               // realm name - only set for cross realm interaction (such as Battlegrounds)
+-    data << uint8(nameData->m_race);
++    data << uint8(player ? player->GetFakeRaceOrRace() : nameData->m_race);
+     data << uint8(nameData->m_gender);
+     data << uint8(nameData->m_class);
+ 
+diff -Naur TrinityCore-4.3.4/src/server/game/Chat/Chat.h source/src/server/game/Chat/Chat.h
+--- TrinityCore-4.3.4/src/server/game/Chat/Chat.h	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/Chat/Chat.h	2014-08-14 12:56:57.421863479 +0200
+@@ -19,6 +19,36 @@
+ #ifndef TRINITYCORE_CHAT_H
+ #define TRINITYCORE_CHAT_H
+ 
++#define MSG_COLOR_LIGHTRED     "|cffff6060"
++#define MSG_COLOR_LIGHTBLUE    "|cff00ccff"
++#define MSG_COLOR_ANN_GREEN    "|c1f40af20"
++#define MSG_COLOR_RED          "|cffff0000"
++#define MSG_COLOR_GOLD         "|cffffcc00"
++#define MSG_COLOR_SUBWHITE     "|cffbbbbbb"
++#define MSG_COLOR_MAGENTA      "|cffff00ff"
++#define MSG_COLOR_YELLOW       "|cffffff00"
++#define MSG_COLOR_CYAN         "|cff00ffff"
++#define MSG_COLOR_DARKBLUE     "|cff0000ff"
++
++#define MSG_COLOR_GREY         "|cff9d9d9d"
++#define MSG_COLOR_WHITE        "|cffffffff"
++#define MSG_COLOR_GREEN        "|cff1eff00"
++#define MSG_COLOR_BLUE         "|cff0080ff"
++#define MSG_COLOR_PURPLE       "|cffb048f8"
++#define MSG_COLOR_ORANGE       "|cffff8000"
++
++#define MSG_COLOR_DRUID        "|cffff7d0a"
++#define MSG_COLOR_HUNTER       "|cffabd473"
++#define MSG_COLOR_MAGE         "|cff69ccf0"
++#define MSG_COLOR_PALADIN      "|cfff58cba"
++#define MSG_COLOR_PRIEST       "|cffffffff"
++#define MSG_COLOR_ROGUE        "|cfffff569"
++#define MSG_COLOR_SHAMAN       "|cff0070de"
++#define MSG_COLOR_WARLOCK      "|cff9482c9"
++#define MSG_COLOR_WARRIOR      "|cffc79c6e"
++#define MSG_COLOR_DEATH_KNIGHT "|cffc41f3b"
++
++
+ #include "SharedDefines.h"
+ #include "WorldSession.h"
+ #include "RBAC.h"
+diff -Naur TrinityCore-4.3.4/src/server/game/World/World.cpp source/src/server/game/World/World.cpp
+--- TrinityCore-4.3.4/src/server/game/World/World.cpp	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/World/World.cpp	2014-08-14 15:06:30.367863479 +0200
+@@ -579,6 +579,7 @@
+         m_int_configs[CONFIG_COMPRESSION] = 1;
+     }
+     m_bool_configs[CONFIG_ADDON_CHANNEL] = sConfigMgr->GetBoolDefault("AddonChannel", true);
++    m_bool_configs[CONFIG_CROSSFACTIONBG] = sConfigMgr->GetBoolDefault("CrossfactionBG.enable", true);
+     m_bool_configs[CONFIG_CLEAN_CHARACTER_DB] = sConfigMgr->GetBoolDefault("CleanCharacterDB", false);
+     m_int_configs[CONFIG_PERSISTENT_CHARACTER_CLEAN_FLAGS] = sConfigMgr->GetIntDefault("PersistentCharacterCleanFlags", 0);
+     m_int_configs[CONFIG_CHAT_CHANNEL_LEVEL_REQ] = sConfigMgr->GetIntDefault("ChatLevelReq.Channel", 1);
+diff -Naur TrinityCore-4.3.4/src/server/game/World/World.h source/src/server/game/World/World.h
+--- TrinityCore-4.3.4/src/server/game/World/World.h	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/game/World/World.h	2014-08-14 13:12:20.150374469 +0200
+@@ -93,6 +93,7 @@
+ enum WorldBoolConfigs
+ {
+     CONFIG_DURABILITY_LOSS_IN_PVP = 0,
++    CONFIG_CROSSFACTIONBG,
+     CONFIG_ADDON_CHANNEL,
+     CONFIG_ALLOW_PLAYER_COMMANDS,
+     CONFIG_CLEAN_CHARACTER_DB,
+diff -Naur TrinityCore-4.3.4/src/server/worldserver/worldserver.conf.dist source/src/server/worldserver/worldserver.conf.dist
+--- TrinityCore-4.3.4/src/server/worldserver/worldserver.conf.dist	2014-08-12 00:45:24.000000000 +0200
++++ source/src/server/worldserver/worldserver.conf.dist	2014-08-14 22:36:33.533951452 +0200
+@@ -2915,3 +2915,15 @@
+ 
+ #
+ ###################################################################################################
++
++###################################################################################################
++#
++# CROSSFACTION BG CONFIG
++#
++#    CrossfactionBG.enable = 1 - Mixed battleground enabled.
++#    CrossfactionBG.enable = 0 - Mixed battleground disabled.
++
++CrossfactionBG.enable = 1
++
++#
++###################################################################################################
+\ Chybí znak konce řádku na konci souboru
